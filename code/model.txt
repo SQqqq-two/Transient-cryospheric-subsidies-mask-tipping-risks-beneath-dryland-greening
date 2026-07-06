@@ -1,0 +1,200 @@
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size, bias):
+        super(ConvLSTMCell, self).__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size
+        self.padding = (kernel_size[0] // 2, kernel_size[1] // 2) 
+        self.bias = bias
+        self.conv = nn.Conv2d(
+            in_channels=self.input_dim + self.hidden_dim,
+            out_channels=4 * self.hidden_dim,
+            kernel_size=self.kernel_size,
+            padding=self.padding,
+            bias=self.bias
+        )
+
+    def forward(self, input_tensor, cur_state):
+        h_cur, c_cur = cur_state
+        combined = torch.cat([input_tensor, h_cur], dim=1)  # [B, C, H, W]
+        combined_conv = self.conv(combined)
+        cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
+
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
+
+        c_next = f * c_cur + i * g
+        h_next = o * torch.tanh(c_next)
+
+        return h_next, c_next
+
+    def init_hidden(self, batch_size, image_size):
+        height, width = image_size
+        return (torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device),
+                torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device))
+
+class ConvLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size, num_layers, batch_first=False, bias=True, return_all_layers=False):
+        super(ConvLSTM, self).__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.num_layers = num_layers
+        self.batch_first = batch_first
+        self.bias = bias
+        self.return_all_layers = return_all_layers
+
+        if not isinstance(self.hidden_dim, list):
+            self.hidden_dim = [self.hidden_dim] * self.num_layers
+
+        self.cell_list = nn.ModuleList()
+
+        for i in range(self.num_layers):
+            cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
+            self.cell_list.append(ConvLSTMCell(input_dim=cur_input_dim,
+                                               hidden_dim=self.hidden_dim[i],
+                                               kernel_size=self.kernel_size,
+                                               bias=self.bias))
+
+    def _init_hidden(self, batch_size, image_size, land_use_data=None):
+        init_states = []
+        for i in range(self.num_layers):
+            if i == 0 and land_use_data is not None:
+                if land_use_data.size(1) != self.hidden_dim[i]:
+                    raise ValueError(f"land_use_data channels ({land_use_data.size(1)}) "
+                                     f"do not match hidden_dim[0] ({self.hidden_dim[i]}).")
+                h, c = land_use_data, torch.zeros_like(land_use_data)
+            else:
+                h, c = (torch.zeros(batch_size, self.hidden_dim[i], *image_size, device=self.cell_list[i].conv.weight.device),
+                        torch.zeros(batch_size, self.hidden_dim[i], *image_size, device=self.cell_list[i].conv.weight.device))
+            init_states.append((h, c))
+        return init_states
+
+    def forward(self, input_tensor, hidden_state=None, land_use_data=None):
+        if not self.batch_first:
+            input_tensor = input_tensor.permute(1, 0, 2, 3, 4)
+
+        b, _, _, h, w = input_tensor.size()
+
+        if hidden_state is None:
+            hidden_state = self._init_hidden(batch_size=b, image_size=(h, w), land_use_data=land_use_data)
+        layer_output_list = []
+        last_state_list = []
+        seq_len = input_tensor.size(1)
+        cur_layer_input = input_tensor
+
+        for layer_idx in range(self.num_layers):
+            h, c = hidden_state[layer_idx]
+            output_inner = []
+
+            for t in range(seq_len):
+                h, c = self.cell_list[layer_idx](input_tensor=cur_layer_input[:, t, :, :, :], cur_state=[h, c])
+                output_inner.append(h)
+
+            layer_output = torch.stack(output_inner, dim=1)
+            cur_layer_input = layer_output
+
+            layer_output_list.append(layer_output)
+            last_state_list.append([h, c])
+
+        if not self.return_all_layers:
+            layer_output_list = layer_output_list[-1:]
+            last_state_list = last_state_list[-1:]
+
+        return layer_output_list, last_state_list
+
+
+    def _check_kernel_size_consistency(self, kernel_size):
+        if not isinstance(kernel_size, tuple):
+            raise ValueError('`kernel_size` must be a tuple having len == num_layers.')
+class MultiHeadFusion(nn.Module):
+    def __init__(self, in_channels, num_heads=4):
+        super(MultiHeadFusion, self).__init__()
+        self.query_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.num_heads = num_heads
+        self.softmax = nn.Softmax(dim=-1)
+        self.output_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+    def forward(self, x1, x2):
+        B, C, H, W = x1.size()
+        Q = self.query_conv(x1).view(B, self.num_heads, C // self.num_heads, H * W) 
+        K = self.key_conv(x2).view(B, self.num_heads, C // self.num_heads, H * W) 
+        V = self.value_conv(x2).view(B, self.num_heads, C // self.num_heads, H * W) 
+
+        attention = torch.matmul(Q.transpose(-2, -1), K) / (C // self.num_heads) ** 0.5 
+        attention = self.softmax(attention)  # [B, num_heads, H*W, H*W]
+
+        fused = torch.matmul(attention, V.transpose(-2, -1)) 
+        fused = fused.transpose(-2, -1).contiguous().view(B, C, H, W)  
+
+        return self.output_conv(fused + x1) 
+
+
+class UpstreamDownstreamModel(nn.Module):
+    def __init__(self, C_u, C_d, H, K,  N, C_out,  N_heads): 
+        super(UpstreamDownstreamModel, self).__init__()
+
+        self.upstream_cnn = nn.Sequential(
+            nn.Conv1d(C_u, H, kernel_size=K, padding=K//2),
+            nn.ReLU(),
+            nn.Conv1d(H, H, kernel_size=K, padding=K//2),
+            nn.ReLU()
+        )
+        self.upstream_gru = nn.GRU(input_size=H, hidden_size=H, batch_first=True)
+
+        self.downstream_convlstm = ConvLSTM(
+            input_dim=C_d,
+            hidden_dim=H,
+            kernel_size=(K, K),
+            num_layers=N,
+            batch_first=True,
+            bias=True,
+            return_all_layers=True
+        )
+
+        self.temporal_conv = nn.Conv3d(
+            in_channels=H,
+            out_channels=H,
+            kernel_size=(K, K, K),
+            padding=(K//2, K//2, K//2)
+        )
+
+        self.landuse_to_hidden = nn.Conv2d(in_channels=1, out_channels=H, kernel_size=1)
+        self.fc = nn.Linear(H, H)
+        self.fusion_module = MultiHeadFusion(embed_dim=H, num_heads=N_heads)
+        self.final_conv = nn.Conv2d(H, C_out, kernel_size=1)
+
+    def forward(self, upstream_data, downstream_data, land_use_data):
+        upstream_out = self.upstream_cnn(upstream_data)        
+        upstream_out = upstream_out.permute(0, 2, 1)             
+        _, upstream_out_mean = self.upstream_gru(upstream_out)    
+        upstream_out_mean = upstream_out_mean.squeeze(0)
+
+        land_use_data = self.landuse_to_hidden(land_use_data) 
+
+        layer_output_list, _ = self.downstream_convlstm(downstream_data, land_use_data=land_use_data)
+        downstream_output = layer_output_list[-1]                 
+        downstream_output = downstream_output.permute(0, 2, 1, 3, 4) 
+        downstream_global_hidden_state = self.temporal_conv(downstream_output)
+
+        upstream_fusion = self.fc(upstream_out_mean) 
+        upstream_fusion = upstream_fusion.unsqueeze(-1).unsqueeze(-1).unsqueeze(2) 
+        upstream_fusion = upstream_fusion.mean(dim=2)  
+        upstream_fusion = F.interpolate(
+            upstream_fusion,
+            size=(downstream_global_hidden_state.size(3), downstream_global_hidden_state.size(4)),
+            mode='bilinear',
+            align_corners=False
+        )
+
+        combined = downstream_global_hidden_state.mean(dim=2) 
+        combined = self.fusion_module(combined, upstream_fusion)
+
+        output = self.final_conv(combined)              
+        return output
